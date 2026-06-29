@@ -314,13 +314,15 @@ class StudioAturiProcurementHunter:
 
     def send_production_email(self, tender: TenderOpportunity, intel: Dict[str, Any], attachments: List[str]):
         """Dispatches an enterprise-formatted HTML email layout with direct file streaming buffers."""
-        smtp_server = os.getenv("SMTP_SERVER")
-        smtp_port = os.getenv("SMTP_PORT", "587")
-        smtp_user = os.getenv("SMTP_USER")
-        smtp_pass = os.getenv("SMTP_PASSWORD")
+        smtp_server = "smtp.gmail.com"  # Explicitly configured for Gmail
+        smtp_port = "587"               # Standard TLS port for secure submission
 
-        if not all([smtp_server, smtp_user, smtp_pass]):
-            logging.error(f"Mail dispatch skipped for {tender.id}: Missing SMTP credentials in .env file.")
+        # Map directly to your existing environment variables
+        smtp_user = os.getenv("SMTP_SENDER_EMAIL")
+        smtp_pass = os.getenv("SMTP_SENDER_PASSWORD")
+
+        if not all([smtp_user, smtp_pass]):
+            logging.error(f"Mail dispatch skipped for {tender.id}: Missing SMTP credentials in environment.")
             return
 
         email_extract = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', tender.description)
