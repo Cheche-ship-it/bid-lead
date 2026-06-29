@@ -1,0 +1,47 @@
+name: Production Job Hunter Run
+
+on:
+  schedule:
+    # 00:33 UTC maps precisely to 3:33 AM Kenyan Time (EAT)
+    - cron: '33 0 * * *'
+  workflow_dispatch: # Allows manual override triggers via the GitHub web UI panel
+
+jobs:
+  run-hunter:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install System Dependencies (Linux Native Headless LibreOffice)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libreoffice-writer libreoffice-java-common
+
+    - name: Install Python Libraries
+      run: |
+        pip install python-docx google-genai python-dotenv requests
+
+    - name: Execute Tailoring Automation Matrix
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        SMTP_SENDER_EMAIL: ${{ secrets.SMTP_SENDER_EMAIL }}
+        SMTP_SENDER_PASSWORD: ${{ secrets.SMTP_SENDER_PASSWORD }}
+      run: |
+        python app.py
+
+    - name: Persist Job Tracking State History
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action Bot"
+        git add processed_jobs.json
+        # Only commits modifications to prevent throwing empty git status workflow errors
+        git commit -m "chore: update processed jobs telemetry [skip ci]" || echo "No new jobs processed on this sweep cycle."
+        git push
