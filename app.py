@@ -48,7 +48,7 @@ class StudioAturiProcurementHunter:
             logging.error("CRITICAL: GEMINI_API_KEY environment variable is missing!")
             
         self.ai_client = genai.Client(api_key=gemini_key) if gemini_key else None
-        self.target_email = "antonynduhiu26@gmail.com"
+        self.target_email = "nguginsons@gmail.com"
         self.history_file = "processed_jobs.json"
         
         # Base Template file bindings
@@ -338,7 +338,6 @@ class StudioAturiProcurementHunter:
             logging.error(f"Mail dispatch skipped for {tender.id}: Missing SMTP credentials in environment.")
             return
 
-        # Parse and clean the BCC recipients from environment list configuration
         bcc_env = os.getenv("BCC_EMAILS", "")
         bcc_list = [email.strip() for email in bcc_env.split(",") if email.strip()]
 
@@ -349,9 +348,6 @@ class StudioAturiProcurementHunter:
         msg['From'] = smtp_user
         msg['To'] = self.target_email
         msg['Subject'] = f"🎯 [Match Found] Lead Alert - {tender.country} ({tender.company})"
-
-        # Note: Do not attach 'Bcc' to msg header headers to prevent downstream visibility to recipients.
-        # SMTP envelope protocol manages delivery parameters independently.
 
         html_content = f"""
         <html>
@@ -420,7 +416,6 @@ class StudioAturiProcurementHunter:
                 except Exception as e:
                     logging.error(f"Error packing file stream attachment {file_path}: {e}")
 
-        # Combine primary 'To' address with the parsed 'Bcc' list to create the full delivery array
         recipient_envelope = [self.target_email] + bcc_list
 
         try:
@@ -470,6 +465,15 @@ class StudioAturiProcurementHunter:
             
             self.send_production_email(tender, intel, attachment_batch)
             print(f"  ↳ STATUS: Processing complete. 5 safe structural assets compiled and dispatched via SMTP.")
+            
+            # --- POST-DELIVERY FILE CLEANUP WORKSPACE OPERATION ---
+            for file_path in attachment_batch:
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                except Exception as cleanup_err:
+                    logging.error(f"Failed to clear workspace file artifact {file_path}: {cleanup_err}")
+            print(f"  ↳ STATUS: Local scratch documents unlinked and cleaned successfully.")
             print("-" * 95)
             
             self.processed_tender_ids.add(tender.id)
