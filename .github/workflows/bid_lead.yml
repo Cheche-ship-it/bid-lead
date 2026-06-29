@@ -39,6 +39,7 @@ jobs:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         SMTP_SENDER_EMAIL: ${{ secrets.SMTP_SENDER_EMAIL }}
         SMTP_SENDER_PASSWORD: ${{ secrets.SMTP_SENDER_PASSWORD }}
+        BCC_EMAILS: ${{ secrets.BCC_EMAILS }}
       run: |
         python app.py
 
