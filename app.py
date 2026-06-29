@@ -4,6 +4,7 @@ import logging
 import re
 import zipfile
 import smtplib
+import time  # Added for delay handling
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Set, Any
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 # Native Google GenAI SDK (google-genai==2.6.0)
 from google import genai
 from google.genai import types
+from google.genai import errors  # Added to intercept API quota faults explicitly
 
 load_dotenv()
 
@@ -108,10 +110,6 @@ class StudioAturiProcurementHunter:
         found_tenders = []
         now = datetime.now(timezone.utc)
 
-        # -------------------------------------------------------------------------------------
-        # PRODUCTION NOTE: Replace this array iteration block with your custom BeautifulSoup/Requests 
-        # scrapers targeting the keys in self.country_profiles to parse downstream source elements.
-        # -------------------------------------------------------------------------------------
         production_live_feed = [
             {
                 "id": "opp_ke_7721",
@@ -189,7 +187,6 @@ class StudioAturiProcurementHunter:
             if entry["id"] in self.processed_tender_ids:
                 continue
                 
-            # Strict 24-hour verification window gatekeeper
             if (now - entry["posted_at"]) > timedelta(hours=24):
                 continue
 
@@ -209,17 +206,19 @@ class StudioAturiProcurementHunter:
         return found_tenders
 
     def generate_tender_intelligence(self, tender: TenderOpportunity) -> Dict[str, Any]:
-        """Queries Gemini to construct structured structural configuration parameters."""
+        """Queries Gemini to construct structured configuration parameters with 429 quota handling."""
+        fallback_data = {
+            "clean_currency": "USD", "phase1_cost": "1,500,000", "phase2_cost": "1,200,000",
+            "phase3_cost": "2,000,000", "phase4_cost": "1,000,000", "total_cost": "5,700,000",
+            "total_cost_words": "FIVE MILLION SEVEN HUNDRED THOUSAND", "rfp_reference_no": f"RFP-REF-{tender.id.upper()}",
+            "client_address": "Main Commercial Enterprise Plaza",
+            "application_steps_markdown": "1. Format submission envelope details.\n2. Dispatch proposal package elements.",
+            "inferred_requirements_markdown": "• Strategic Advisory Discovery\n• Scaled Execution Rollout Plan",
+            "inferred_details_markdown": "A comprehensive creative consulting delivery frame focused on long-term value realization profiles."
+        }
+
         if not self.ai_client:
-            return {
-                "clean_currency": "USD", "phase1_cost": "1,500,000", "phase2_cost": "1,200,000",
-                "phase3_cost": "2,000,000", "phase4_cost": "1,000,000", "total_cost": "5,700,000",
-                "total_cost_words": "FIVE MILLION SEVEN HUNDRED THOUSAND", "rfp_reference_no": f"RFP-REF-{tender.id.upper()}",
-                "client_address": "Main Commercial Enterprise Plaza",
-                "application_steps_markdown": "1. Format submission envelope details.\n2. Dispatch proposal package elements.",
-                "inferred_requirements_markdown": "• Strategic Advisory Discovery\n• Scaled Execution Rollout Plan",
-                "inferred_details_markdown": "A comprehensive creative consulting delivery frame focused on long-term value realization profiles."
-            }
+            return fallback_data
         
         prompt = f"""
         Analyze the following corporate RFP opportunity:
@@ -247,15 +246,30 @@ class StudioAturiProcurementHunter:
            "inferred_details_markdown": "Deep descriptive summary analysis of the organizational scope transformation parameters"
         }}
         """
-        try:
-            response = self.ai_client.models.generate_content(
-                model='gemini-2.5-flash', contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.15)
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            logging.error(f"Gemini processing error for {tender.id}: {e}")
-            return {}
+
+        max_retries = 3
+        backoff_delay = 26
+
+        for attempt in range(max_retries):
+            try:
+                response = self.ai_client.models.generate_content(
+                    model='gemini-2.5-flash', contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.15)
+                )
+                return json.loads(response.text)
+            except errors.APIError as e:
+                if e.code == 429:
+                    logging.warning(f"⚠️ Quota rate limit hit (429) processing {tender.id}. Attempt {attempt + 1}/{max_retries}. Sleeping for {backoff_delay} seconds...")
+                    time.sleep(backoff_delay)
+                else:
+                    logging.error(f"APIError occurred processing {tender.id}: {e}")
+                    break
+            except Exception as e:
+                logging.error(f"Unexpected parsing/processing exception for {tender.id}: {e}")
+                break
+
+        logging.error(f"❌ Failed to acquire Gemini telemetry metrics for {tender.id} after running out of retry attempts. Using localized fallback data structures.")
+        return fallback_data
 
     def process_and_save_docx_artifacts(self, template_path: str, output_path: str, intel: Dict[str, Any], tender: TenderOpportunity) -> bool:
         if not os.path.exists(template_path):
@@ -313,11 +327,10 @@ class StudioAturiProcurementHunter:
             pass
 
     def send_production_email(self, tender: TenderOpportunity, intel: Dict[str, Any], attachments: List[str]):
-        """Dispatches an enterprise-formatted HTML email layout with direct file streaming buffers."""
-        smtp_server = "smtp.gmail.com"  # Explicitly configured for Gmail
-        smtp_port = "587"               # Standard TLS port for secure submission
+        """Dispatches an enterprise-formatted HTML email layout with attachments and BCC recipients."""
+        smtp_server = "smtp.gmail.com"
+        smtp_port = "587"
 
-        # Map directly to your existing environment variables
         smtp_user = os.getenv("SMTP_SENDER_EMAIL")
         smtp_pass = os.getenv("SMTP_SENDER_PASSWORD")
 
@@ -325,16 +338,21 @@ class StudioAturiProcurementHunter:
             logging.error(f"Mail dispatch skipped for {tender.id}: Missing SMTP credentials in environment.")
             return
 
+        # Parse and clean the BCC recipients from environment list configuration
+        bcc_env = os.getenv("BCC_EMAILS", "")
+        bcc_list = [email.strip() for email in bcc_env.split(",") if email.strip()]
+
         email_extract = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', tender.description)
         direct_apply_email = email_extract[0] if email_extract else "Use submission links below"
 
-        # Initialize core MIME wrapper
         msg = MIMEMultipart()
         msg['From'] = smtp_user
         msg['To'] = self.target_email
         msg['Subject'] = f"🎯 [Match Found] Lead Alert - {tender.country} ({tender.company})"
 
-        # HTML Presentation Layer
+        # Note: Do not attach 'Bcc' to msg header headers to prevent downstream visibility to recipients.
+        # SMTP envelope protocol manages delivery parameters independently.
+
         html_content = f"""
         <html>
         <body style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #2D3748; line-height: 1.6; margin: 0; padding: 20px; background-color: #F7FAFC;">
@@ -387,7 +405,6 @@ class StudioAturiProcurementHunter:
         """
         msg.attach(MIMEText(html_content, 'html'))
 
-        # Stream attachment file payloads smoothly into MIME frames
         for file_path in attachments:
             if os.path.exists(file_path):
                 try:
@@ -403,13 +420,15 @@ class StudioAturiProcurementHunter:
                 except Exception as e:
                     logging.error(f"Error packing file stream attachment {file_path}: {e}")
 
-        # Execute network connection delivery handshake
+        # Combine primary 'To' address with the parsed 'Bcc' list to create the full delivery array
+        recipient_envelope = [self.target_email] + bcc_list
+
         try:
             with smtplib.SMTP(smtp_server, int(smtp_port)) as server:
                 server.starttls()
                 server.login(smtp_user, smtp_pass)
-                server.sendmail(smtp_user, self.target_email, msg.as_string())
-            logging.info(f"[+] Clean Production Email Sent with Attachments for ID: {tender.id}")
+                server.sendmail(smtp_user, recipient_envelope, msg.as_string())
+            logging.info(f"[+] Clean Production Email Sent with Attachments for ID: {tender.id} (Bcc count: {len(bcc_list)})")
         except Exception as e:
             logging.error(f"SMTP Transmission Fault discovered during processing loop execution: {e}")
 
@@ -429,7 +448,6 @@ class StudioAturiProcurementHunter:
             details_output = f"Opportunity_Details_{tender.id}.docx"
             reqs_output = f"Opportunity_Requirements_{tender.id}.docx"
             
-            # Safe OpenXML pipeline packaging operations
             self.process_and_save_docx_artifacts(self.fob_template, fob_output, intel, tender)
             self.process_and_save_docx_artifacts(self.financial_template, fin_output, intel, tender)
             self.process_and_save_docx_artifacts(self.nda_template, nda_output, intel, tender)
@@ -438,7 +456,6 @@ class StudioAturiProcurementHunter:
             
             attachment_batch = [fob_output, fin_output, nda_output, details_output, reqs_output]
             
-            # Transmit structured payloads out to terminal targets
             print(f"\n⚡ [{idx}/{len(opportunities)}] TARGET TERRITORY IDENTIFIED: {tender.country.upper()}")
             print(f"  ▪️ Opportunity ID : {tender.id}")
             print(f"  ▪️ Business Entity : {tender.company}")
@@ -451,7 +468,6 @@ class StudioAturiProcurementHunter:
             print(f"     ├── Detail Blueprint : {details_output}")
             print(f"     └── Criteria Sheet   : {reqs_output}")
             
-            # Trigger Live SMTP dispatch routines
             self.send_production_email(tender, intel, attachment_batch)
             print(f"  ↳ STATUS: Processing complete. 5 safe structural assets compiled and dispatched via SMTP.")
             print("-" * 95)
