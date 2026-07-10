@@ -5,7 +5,8 @@ import re
 import hashlib
 import zipfile
 import smtplib
-import time  # Added for delay handling
+import time
+import io
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Set, Any
 from dataclasses import dataclass
@@ -21,32 +22,22 @@ from dotenv import load_dotenv
 # Native Google GenAI SDK (google-genai==2.6.0)
 from google import genai
 from google.genai import types
-from google.genai import errors  # Added to intercept API quota faults explicitly
+from google.genai import errors
 
 load_dotenv()
 
-# Log formatting configurations
+# Production Log formatting configuration
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] - %(message)s'
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 
 DISCOVERY_TERMS = [
-    "tender",
-    "rfp",
-    "request for proposal",
-    "request for quotation",
-    "rfq",
-    "eoi",
-    "expression of interest",
-    "consultancy",
-    "procurement",
-    "bid",
-    "opportunity",
-    "invitation to tender",
-    "call for proposals",
+    "tender", "rfp", "request for proposal", "request for quotation",
+    "rfq", "eoi", "expression of interest", "consultancy",
+    "procurement", "bid", "opportunity", "invitation to tender", "call for proposals",
 ]
 
 
@@ -78,9 +69,11 @@ class PortalHTMLParser(HTMLParser):
         elif tag == "meta":
             name = (attrs.get("name") or attrs.get("property") or "").lower()
             content = self._clean(attrs.get("content", ""))
-            if name in {"description", "og:description", "twitter:description"} and content and not self.meta_description:
+            if name in {"description", "og:description",
+                        "twitter:description"} and content and not self.meta_description:
                 self.meta_description = content
-            elif name in {"article:published_time", "og:updated_time", "date", "dc.date", "pubdate"} and content and not self.meta_published_time:
+            elif name in {"article:published_time", "og:updated_time", "date", "dc.date",
+                          "pubdate"} and content and not self.meta_published_time:
                 self.meta_published_time = content
             elif name in {"og:site_name", "application-name"} and content and not self.meta_site_name:
                 self.meta_site_name = content
@@ -109,6 +102,7 @@ class PortalHTMLParser(HTMLParser):
     def close(self):
         super().close()
 
+
 @dataclass
 class TenderOpportunity:
     id: str
@@ -120,58 +114,73 @@ class TenderOpportunity:
     source_portal: str
     posted_at: datetime
 
+
 class StudioAturiProcurementHunter:
     def __init__(self):
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not gemini_key:
             logging.error("CRITICAL: GEMINI_API_KEY environment variable is missing!")
-            
+
         self.ai_client = genai.Client(api_key=gemini_key) if gemini_key else None
-        self.target_email = "nguginsons@gmail.com"
         # self.target_email = "nduhiu254@gmail.com"
+        self.target_email = "nguginsons@gmail.com"
         self.history_file = "processed_jobs.json"
-        
-        # Base Template file bindings
+
         self.fob_template = "Studio_Aturi_Form_of_Bid.docx"
         self.financial_template = "Studio_Aturi_Financial_Proposal.docx"
         self.nda_template = "Studio_Aturi_Mutual_NDA.docx"
+
         self.http_timeout = 20
         self.http_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            )
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         }
-        
-        # Targeted country matrix rule profiles
+
         self.country_profiles = {
             "Kenya": {
-                "keywords": ["Corporate Brand Strategy", "Brand Mergers & Acquisitions", "Fintech Identity", "Financial Services Branding", "FMCG Packaging Design", "Product SKU Design", "Consumer Insights", "Market Discovery", "Corporate Identity Guidelines", "Brand Manual", "Value Proposition Development", "Stakeholder Perception Survey"],
-                "urls": ["https://tenderflow.co.ke", "https://developmentaid.org", "https://safaricom.co.ke/about/suppliers", "https://eastafricatenders.com"]
+                "keywords": ["Corporate Brand Strategy", "Brand Mergers & Acquisitions", "Fintech Identity",
+                             "Financial Services Branding", "FMCG Packaging Design", "Product SKU Design",
+                             "Consumer Insights", "Market Discovery", "Corporate Identity Guidelines", "Brand Manual",
+                             "Value Proposition Development", "Stakeholder Perception Survey"],
+                "urls": ["https://tenderflow.co.ke", "https://developmentaid.org",
+                         "https://safaricom.co.ke/about/suppliers", "https://eastafricatenders.com"]
             },
             "Uganda": {
-                "keywords": ["Brand Audit & Diagnostic", "Corporate Profile", "Visual Identity Review", "Customer Experience Strategy", "CX Strategy", "Audience Profiling", "NGO Campaign Branding", "Commercial Product Packaging"],
+                "keywords": ["Brand Audit & Diagnostic", "Corporate Profile", "Visual Identity Review",
+                             "Customer Experience Strategy", "CX Strategy", "Audience Profiling",
+                             "NGO Campaign Branding", "Commercial Product Packaging"],
                 "urls": ["https://tenders.unp.me", "https://kazitenders.co.ug", "https://ungm.org"]
             },
             "Tanzania": {
-                "keywords": ["Corporate Image", "Reputation Management", "Brand Architecture Development", "Strategic Positioning", "Private Sector Packaging Design", "Insurance & Pensions Private Fund Communication", "Rollout Management", "Brand Launch Activation"],
+                "keywords": ["Corporate Image", "Reputation Management", "Brand Architecture Development",
+                             "Strategic Positioning", "Private Sector Packaging Design",
+                             "Insurance & Pensions Private Fund Communication", "Rollout Management",
+                             "Brand Launch Activation"],
                 "urls": ["https://tanzaniatenders.com", "https://zoomtanzania.com"]
             },
             "Rwanda": {
-                "keywords": ["Digital Transformation Branding", "Tech Brand Strategy", "Service Design", "Product Innovation", "Design Thinking Framework", "Human-Centered Design Research", "HCD Research", "Brand Advisory Services", "Organizational Rebranding", "Perception Mapping"],
+                "keywords": ["Digital Transformation Branding", "Tech Brand Strategy", "Service Design",
+                             "Product Innovation", "Design Thinking Framework", "Human-Centered Design Research",
+                             "HCD Research", "Brand Advisory Services", "Organizational Rebranding",
+                             "Perception Mapping"],
                 "urls": ["https://jobinrwanda.com/tenders", "https://psf.org.rw"]
             },
             "Congo": {
-                "keywords": ["Refonte de l'Identité Visuelle", "Identité Corporative", "Stratégie de Marque", "Conception d’Emballage FMCG", "Communication de Changement de Culture", "Creative Direction", "Brand Asset Management"],
+                "keywords": ["Refonte de l'Identité Visuelle", "Identité Corporative", "Stratégie de Marque",
+                             "Conception d’Emballage FMCG", "Communication de Changement de Culture",
+                             "Creative Direction", "Brand Asset Management"],
                 "urls": ["https://mediacongo.net", "https://congovirtuel.com"]
             },
             "Dubai": {
-                "keywords": ["Brand Positioning", "Naming Architecture", "Brand Advisory", "Strategy Pivot", "Luxury Packaging Design", "Advanced Marketing", "Creative Strategy", "Customer Experience Strategy", "Journey Mapping", "Value Proposition Development", "Fintech Identity"],
+                "keywords": ["Brand Positioning", "Naming Architecture", "Brand Advisory", "Strategy Pivot",
+                             "Luxury Packaging Design", "Advanced Marketing", "Creative Strategy",
+                             "Customer Experience Strategy", "Journey Mapping", "Value Proposition Development",
+                             "Fintech Identity"],
                 "urls": ["https://tenderuae.com", "https://tejari.com"]
             },
             "Ethiopia": {
-                "keywords": ["Corporate Rebranding and Strategy", "Brand Architecture", "Identity Manual", "Consumer Insights", "Audience Profiling", "Export Product SKU Design", "Strategic Positioning"],
+                "keywords": ["Corporate Rebranding and Strategy", "Brand Architecture", "Identity Manual",
+                             "Consumer Insights", "Audience Profiling", "Export Product SKU Design",
+                             "Strategic Positioning"],
                 "urls": ["https://tenders.2merkato.com", "https://thereporterethiopia.com"]
             }
         }
@@ -197,11 +206,7 @@ class StudioAturiProcurementHunter:
         return re.sub(r"\s+", " ", (value or "")).strip()
 
     def _fetch_url(self, url: str) -> str:
-        response = requests.get(
-            url,
-            headers=self.http_headers,
-            timeout=self.http_timeout,
-        )
+        response = requests.get(url, headers=self.http_headers, timeout=self.http_timeout)
         response.raise_for_status()
         return response.text
 
@@ -221,16 +226,8 @@ class StudioAturiProcurementHunter:
         except Exception:
             pass
 
-        for fmt in (
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%Y-%m-%d",
-            "%d %b %Y",
-            "%d %B %Y",
-            "%B %d, %Y",
-            "%d/%m/%Y",
-            "%m/%d/%Y",
-        ):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%B %d, %Y", "%d/%m/%Y",
+                    "%m/%d/%Y"):
             try:
                 parsed = datetime.strptime(raw, fmt)
                 return parsed.replace(tzinfo=timezone.utc)
@@ -258,6 +255,7 @@ class StudioAturiProcurementHunter:
 
     def _scrape_portal(self, portal_url: str, country: str, country_keywords: List[str]) -> List[TenderOpportunity]:
         opportunities: List[TenderOpportunity] = []
+        logging.info(f"Scraping portal channel: {portal_url} ({country})")
         try:
             listing_html = self._fetch_url(portal_url)
         except Exception as exc:
@@ -271,9 +269,7 @@ class StudioAturiProcurementHunter:
         candidate_links = []
         seen_links: Set[str] = set()
         listing_context = " ".join([
-            listing_parser.title,
-            listing_parser.meta_description,
-            self._extract_text_snippet(listing_parser, limit=6),
+            listing_parser.title, listing_parser.meta_description, self._extract_text_snippet(listing_parser, limit=6)
         ])
         page_relevant = self._looks_relevant(listing_context, country_keywords)
         portal_host = urlparse(portal_url).netloc.replace("www.", "")
@@ -292,7 +288,8 @@ class StudioAturiProcurementHunter:
                 continue
             if normalized_url in seen_links:
                 continue
-            if page_relevant or self._looks_relevant(text, country_keywords) or self._looks_relevant(normalized_url, country_keywords):
+            if page_relevant or self._looks_relevant(text, country_keywords) or self._looks_relevant(normalized_url,
+                                                                                                     country_keywords):
                 candidate_links.append((normalized_url, text))
                 seen_links.add(normalized_url)
 
@@ -310,32 +307,19 @@ class StudioAturiProcurementHunter:
                 detail_parser.feed(detail_html)
                 detail_parser.close()
 
-            combined_title = self._clean_text(
-                detail_parser.title or anchor_text or listing_parser.title or portal_url
-            )
+            combined_title = self._clean_text(detail_parser.title or anchor_text or listing_parser.title or portal_url)
             combined_description = self._clean_text(
-                " ".join(
-                    part
-                    for part in [
-                        detail_parser.meta_description,
-                        self._extract_text_snippet(detail_parser),
-                        listing_parser.meta_description,
-                    ]
-                    if part
-                )
+                " ".join(part for part in [detail_parser.meta_description, self._extract_text_snippet(detail_parser),
+                                           listing_parser.meta_description] if part)
             )
 
             if not self._looks_relevant(f"{combined_title} {combined_description}", country_keywords):
                 continue
-
             if not combined_title:
                 continue
 
-            posted_at = (
-                self._parse_datetime(detail_parser.meta_published_time)
-                or self._parse_datetime(listing_parser.meta_published_time)
-                or datetime.now(timezone.utc)
-            )
+            posted_at = self._parse_datetime(detail_parser.meta_published_time) or self._parse_datetime(
+                listing_parser.meta_published_time) or datetime.now(timezone.utc)
             if (datetime.now(timezone.utc) - posted_at) > timedelta(days=30):
                 continue
 
@@ -349,21 +333,14 @@ class StudioAturiProcurementHunter:
 
             opportunities.append(
                 TenderOpportunity(
-                    id=tender_id,
-                    title=combined_title,
-                    company=company,
-                    country=country,
-                    description=combined_description or combined_title,
-                    apply_url=detail_url,
-                    source_portal=urlparse(portal_url).netloc.replace("www.", "") or portal_url,
-                    posted_at=posted_at,
+                    id=tender_id, title=combined_title, company=company, country=country,
+                    description=combined_description or combined_title, apply_url=detail_url,
+                    source_portal=urlparse(portal_url).netloc.replace("www.", "") or portal_url, posted_at=posted_at
                 )
             )
-
         return opportunities
 
     def scrape_all_opportunities(self) -> List[TenderOpportunity]:
-        """Fetch and filter live opportunities from the configured portal URLs."""
         found_tenders: List[TenderOpportunity] = []
         seen_ids: Set[str] = set()
 
@@ -377,14 +354,15 @@ class StudioAturiProcurementHunter:
                     seen_ids.add(tender.id)
                     found_tenders.append(tender)
 
+        logging.info(f"Total novel candidate opportunities discovered: {len(found_tenders)}")
         return found_tenders
 
     def generate_tender_intelligence(self, tender: TenderOpportunity) -> Dict[str, Any]:
-        """Queries Gemini to construct structured configuration parameters with 429 quota handling."""
         fallback_data = {
             "clean_currency": "USD", "phase1_cost": "1,500,000", "phase2_cost": "1,200,000",
             "phase3_cost": "2,000,000", "phase4_cost": "1,000,000", "total_cost": "5,700,000",
-            "total_cost_words": "FIVE MILLION SEVEN HUNDRED THOUSAND", "rfp_reference_no": f"RFP-REF-{tender.id.upper()}",
+            "total_cost_words": "FIVE MILLION SEVEN HUNDRED THOUSAND",
+            "rfp_reference_no": f"RFP-REF-{tender.id.upper()}",
             "client_address": "Main Commercial Enterprise Plaza",
             "application_steps_markdown": "1. Format submission envelope details.\n2. Dispatch proposal package elements.",
             "inferred_requirements_markdown": "• Strategic Advisory Discovery\n• Scaled Execution Rollout Plan",
@@ -393,17 +371,17 @@ class StudioAturiProcurementHunter:
 
         if not self.ai_client:
             return fallback_data
-        
+
         prompt = f"""
         Analyze the following corporate RFP opportunity:
         Title: {tender.title}
         Company: {tender.company}
         Country: {tender.country}
         Description: {tender.description}
-        
+
         Generate a structured JSON configuration layout containing metadata mappings to customize corporate template blocks.
         The extracted currency should follow localized context (e.g., KES for Kenya, AED for Dubai, USD for global NGOs).
-        
+
         Return ONLY a JSON object matching this schema exactly:
         {{
            "clean_currency": "USD",
@@ -433,21 +411,25 @@ class StudioAturiProcurementHunter:
                 return json.loads(response.text)
             except errors.APIError as e:
                 if e.code == 429:
-                    logging.warning(f"⚠️ Quota rate limit hit (429) processing {tender.id}. Attempt {attempt + 1}/{max_retries}. Sleeping for {backoff_delay} seconds...")
+                    logging.warning(
+                        f"Quota rate limit hit (429). Attempt {attempt + 1}/{max_retries}. Backing off for {backoff_delay}s...")
                     time.sleep(backoff_delay)
                 else:
                     logging.error(f"APIError occurred processing {tender.id}: {e}")
                     break
             except Exception as e:
-                logging.error(f"Unexpected parsing/processing exception for {tender.id}: {e}")
+                logging.error(f"Unexpected parsing exception for {tender.id}: {e}")
                 break
 
-        logging.error(f"❌ Failed to acquire Gemini telemetry metrics for {tender.id} after running out of retry attempts. Using localized fallback data structures.")
+        logging.error(f"Failed to acquire Gemini metrics for {tender.id}. Using production fallback structures.")
         return fallback_data
 
-    def process_and_save_docx_artifacts(self, template_path: str, output_path: str, intel: Dict[str, Any], tender: TenderOpportunity) -> bool:
+    def process_docx_to_memory(self, template_path: str, intel: Dict[str, Any],
+                               tender: TenderOpportunity) -> io.BytesIO | None:
+        """Processes docx templates completely in memory, avoiding heavy local storage reads/writes."""
         if not os.path.exists(template_path):
-            return False
+            logging.error(f"Template path missing from system context: {template_path}")
+            return None
         try:
             replacements = {
                 "[Insert Date]": datetime.now().strftime("%B %d, %Y"),
@@ -462,28 +444,37 @@ class StudioAturiProcurementHunter:
                 "[Insert Currency and Total Numeric Amount]": f"{intel.get('clean_currency')} {intel.get('total_cost')}",
                 "[Insert Amount in Words]": intel.get("total_cost_words", "SPECIFIED AMOUNT"),
                 "[Insert Total]": intel.get("total_cost"),
-                "[Insert Amount]": intel.get("phase1_cost", "As Agreed") 
+                "[Insert Amount]": intel.get("phase1_cost", "As Agreed")
             }
+
+            memory_buffer = io.BytesIO()
             with zipfile.ZipFile(template_path, 'r') as zin:
-                with zipfile.ZipFile(output_path, 'w') as zout:
+                with zipfile.ZipFile(memory_buffer, 'w', zipfile.ZIP_DEFLATED) as zout:
                     for item in zin.infolist():
                         data = zin.read(item.filename)
-                        if "document.xml" in item.filename or "header" in item.filename or "footer" in item.filename:
+                        if any(x in item.filename for x in ["document.xml", "header", "footer"]):
                             xml_content = data.decode('utf-8', errors='ignore')
                             for placeholder, replacement in replacements.items():
                                 xml_content = xml_content.replace(placeholder, str(replacement))
                             data = xml_content.encode('utf-8')
                         zout.writestr(item, data)
-            return True
-        except:
-            return False
 
-    def create_informational_docx_safely(self, template_path: str, output_path: str, title: str, content_markdown: str):
-        if not os.path.exists(template_path): return
+            memory_buffer.seek(0)
+            return memory_buffer
+        except Exception as e:
+            logging.error(f"Failed to generate in-memory structural template {template_path}: {e}")
+            return None
+
+    def create_informational_docx_in_memory(self, template_path: str, title: str,
+                                            content_markdown: str) -> io.BytesIO | None:
+        if not os.path.exists(template_path):
+            return None
         try:
-            clean_content = content_markdown.replace("\n", " ").replace('"', '\\"').replace("<", "&lt;").replace(">", "&gt;")
+            clean_content = content_markdown.replace("\n", " ").replace('"', '\\"').replace("<", "&lt;").replace(">",
+                                                                                                                 "&gt;")
+            memory_buffer = io.BytesIO()
             with zipfile.ZipFile(template_path, 'r') as zin:
-                with zipfile.ZipFile(output_path, 'w') as zout:
+                with zipfile.ZipFile(memory_buffer, 'w', zipfile.ZIP_DEFLATED) as zout:
                     for item in zin.infolist():
                         data = zin.read(item.filename)
                         if "document.xml" in item.filename:
@@ -497,21 +488,15 @@ class StudioAturiProcurementHunter:
                             ).format(doc_title=title, doc_content=clean_content)
                             data = document_wireframe.encode('utf-8')
                         zout.writestr(item, data)
-        except:
-            pass
+            memory_buffer.seek(0)
+            return memory_buffer
+        except Exception as e:
+            logging.error(f"In-memory markdown document tracking failure: {e}")
+            return None
 
-    def send_production_email(self, tender: TenderOpportunity, intel: Dict[str, Any], attachments: List[str]):
-        """Dispatches an enterprise-formatted HTML email layout with attachments and BCC recipients."""
-        smtp_server = "smtp.gmail.com"
-        smtp_port = "587"
-
-        smtp_user = os.getenv("SMTP_SENDER_EMAIL")
-        smtp_pass = os.getenv("SMTP_SENDER_PASSWORD")
-
-        if not all([smtp_user, smtp_pass]):
-            logging.error(f"Mail dispatch skipped for {tender.id}: Missing SMTP credentials in environment.")
-            return
-
+    def send_production_email(self, smtp_session: smtplib.SMTP, sender_email: str, tender: TenderOpportunity,
+                              intel: Dict[str, Any], memory_attachments: Dict[str, io.BytesIO]):
+        """Dispatches email payloads securely over an active, persistent SMTP stream session."""
         bcc_env = os.getenv("BCC_EMAILS", "")
         bcc_list = [email.strip() for email in bcc_env.split(",") if email.strip()]
 
@@ -519,7 +504,7 @@ class StudioAturiProcurementHunter:
         direct_apply_email = email_extract[0] if email_extract else "Use submission links below"
 
         msg = MIMEMultipart()
-        msg['From'] = smtp_user
+        msg['From'] = sender_email
         msg['To'] = self.target_email
         msg['Subject'] = f"🎯 [Match Found] Lead Alert - {tender.country} ({tender.company})"
 
@@ -575,91 +560,116 @@ class StudioAturiProcurementHunter:
         """
         msg.attach(MIMEText(html_content, 'html'))
 
-        for file_path in attachments:
-            if os.path.exists(file_path):
+        for file_name, memory_stream in memory_attachments.items():
+            if memory_stream is not None:
                 try:
-                    with open(file_path, "rb") as attachment:
-                        part = MIMEBase("application", "octet-stream")
-                        part.set_payload(attachment.read())
-                        encoders.encode_base64(part)
-                        part.add_header(
-                            "Content-Disposition",
-                            f"attachment; filename={os.path.basename(file_path)}",
-                        )
-                        msg.attach(part)
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(memory_stream.read())
+                    encoders.encode_base64(part)
+                    part.add_header("Content-Disposition", f"attachment; filename={file_name}")
+                    msg.attach(part)
+                    # Reset buffer read head position for structural re-entry checks if needed
+                    memory_stream.seek(0)
                 except Exception as e:
-                    logging.error(f"Error packing file stream attachment {file_path}: {e}")
+                    logging.error(f"Error packing file stream memory buffer allocation {file_name}: {e}")
 
         recipient_envelope = [self.target_email] + bcc_list
-
-        try:
-            with smtplib.SMTP(smtp_server, int(smtp_port)) as server:
-                server.starttls()
-                server.login(smtp_user, smtp_pass)
-                server.sendmail(smtp_user, recipient_envelope, msg.as_string())
-            logging.info(f"[+] Clean Production Email Sent with Attachments for ID: {tender.id} (Bcc count: {len(bcc_list)})")
-        except Exception as e:
-            logging.error(f"SMTP Transmission Fault discovered during processing loop execution: {e}")
+        smtp_session.sendmail(sender_email, recipient_envelope, msg.as_string())
+        logging.info(
+            f"[+] Direct Payload Dispatched via Open SMTP Stream for ID: {tender.id} (Bcc elements: {len(bcc_list)})")
 
     def run(self):
         opportunities = self.scrape_all_opportunities()
-        
-        print("\n" + "="*95)
-        print(f" 🎯 STUDIO ATURI AUTOMATED PROCUREMENT MATRICES — RUN EXECUTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*95)
-        
-        for idx, tender in enumerate(opportunities, 1):
-            intel = self.generate_tender_intelligence(tender)
-            
-            fob_output = f"Studio_Aturi_Form_of_Bid_{tender.id}.docx"
-            fin_output = f"Studio_Aturi_Financial_Proposal_{tender.id}.docx"
-            nda_output = f"Studio_Aturi_Mutual_NDA_{tender.id}.docx"
-            details_output = f"Opportunity_Details_{tender.id}.docx"
-            reqs_output = f"Opportunity_Requirements_{tender.id}.docx"
-            
-            self.process_and_save_docx_artifacts(self.fob_template, fob_output, intel, tender)
-            self.process_and_save_docx_artifacts(self.financial_template, fin_output, intel, tender)
-            self.process_and_save_docx_artifacts(self.nda_template, nda_output, intel, tender)
-            self.create_informational_docx_safely(self.nda_template, details_output, f"Details - {tender.title}", intel.get("inferred_details_markdown", ""))
-            self.create_informational_docx_safely(self.nda_template, reqs_output, f"Requirements - {tender.title}", intel.get("inferred_requirements_markdown", ""))
-            
-            attachment_batch = [fob_output, fin_output, nda_output, details_output, reqs_output]
-            
-            print(f"\n⚡ [{idx}/{len(opportunities)}] TARGET TERRITORY IDENTIFIED: {tender.country.upper()}")
-            print(f"  ▪️ Opportunity ID : {tender.id}")
-            print(f"  ▪️ Business Entity : {tender.company}")
-            print(f"  ▪️ Pipeline Focus  : {tender.title}")
-            print(f"  ▪️ Intake Portal   : {tender.source_portal} ({tender.apply_url})")
-            print(f"  📦 Generated Valid Word Artifact Package Components:")
-            print(f"     ├── Commercial Sheet : {fob_output}")
-            print(f"     ├── Financial Matrix : {fin_output}")
-            print(f"     ├── Mutual NDA Block : {nda_output}")
-            print(f"     ├── Detail Blueprint : {details_output}")
-            print(f"     └── Criteria Sheet   : {reqs_output}")
-            
-            self.send_production_email(tender, intel, attachment_batch)
-            print(f"  ↳ STATUS: Processing complete. 5 safe structural assets compiled and dispatched via SMTP.")
-            
-            # --- POST-DELIVERY FILE CLEANUP WORKSPACE OPERATION ---
-            for file_path in attachment_batch:
-                try:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                except Exception as cleanup_err:
-                    logging.error(f"Failed to clear workspace file artifact {file_path}: {cleanup_err}")
-            print(f"  ↳ STATUS: Local scratch documents unlinked and cleaned successfully.")
-            print("-" * 95)
-            
-            self.processed_tender_ids.add(tender.id)
-            self._save_history()
-            
-        print("\n" + "="*95)
+
+        print("\n" + "=" * 95)
+        print(
+            f" 🎯 STUDIO ATURI AUTOMATED PROCUREMENT MATRICES — RUN EXECUTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 95)
+
+        if not opportunities:
+            logging.info("Zero pending matches to process. Closing tracking context.")
+            return
+
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        smtp_user = os.getenv("SMTP_SENDER_EMAIL")
+        smtp_pass = os.getenv("SMTP_SENDER_PASSWORD")
+
+        if not all([smtp_user, smtp_pass]):
+            logging.critical("Mail pipeline aborted: Missing SMTP deployment keys in environment.")
+            return
+
+        # Initialize the persistent SMTP session pipeline context once
+        logging.info(f"Opening shared TCP connection stream to target mail server: {smtp_server}:{smtp_port}")
+        try:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                logging.info("Shared SMTP socket verification authentication sequence complete.")
+
+                for idx, tender in enumerate(opportunities, 1):
+                    logging.info(f"Processing sequence node [{idx}/{len(opportunities)}] -> ID: {tender.id}")
+                    intel = self.generate_tender_intelligence(tender)
+
+                    # Allocate unique output names
+                    fob_name = f"Studio_Aturi_Form_of_Bid_{tender.id}.docx"
+                    fin_name = f"Studio_Aturi_Financial_Proposal_{tender.id}.docx"
+                    nda_name = f"Studio_Aturi_Mutual_NDA_{tender.id}.docx"
+                    details_name = f"Opportunity_Details_{tender.id}.docx"
+                    reqs_name = f"Opportunity_Requirements_{tender.id}.docx"
+
+                    # Generate virtual in-memory file buffers
+                    memory_attachments = {
+                        fob_name: self.process_docx_to_memory(self.fob_template, intel, tender),
+                        fin_name: self.process_docx_to_memory(self.financial_template, intel, tender),
+                        nda_name: self.process_docx_to_memory(self.nda_template, intel, tender),
+                        details_name: self.create_informational_docx_in_memory(self.nda_template,
+                                                                               f"Details - {tender.title}",
+                                                                               intel.get("inferred_details_markdown",
+                                                                                         "")),
+                        reqs_name: self.create_informational_docx_in_memory(self.nda_template,
+                                                                            f"Requirements - {tender.title}",
+                                                                            intel.get("inferred_requirements_markdown",
+                                                                                      ""))
+                    }
+
+                    print(f"\n⚡ [{idx}/{len(opportunities)}] TARGET TERRITORY IDENTIFIED: {tender.country.upper()}")
+                    print(f"  ▪️ Opportunity ID : {tender.id}")
+                    print(f"  ▪️ Business Entity : {tender.company}")
+                    print(f"  ▪️ Pipeline Focus  : {tender.title}")
+                    print(f"  ▪️ Intake Portal   : {tender.source_portal}")
+                    print(f"  📦 Generated Valid Virtual Artifact Package Components inside RAM Workspace Allocation.")
+
+                    # Push via current open execution pipeline context block
+                    self.send_production_email(server, smtp_user, tender, intel, memory_attachments)
+
+                    # Force closing memory buffers instantly to reclaim platform heap space dynamically
+                    for buf in memory_attachments.values():
+                        if buf:
+                            buf.close()
+
+                    print(
+                        f"  ↳ STATUS: Node pipeline execution completed. Safe virtual memory buffers unlinked cleanly.")
+                    print("-" * 95)
+
+                    self.processed_tender_ids.add(tender.id)
+                    self._save_history()
+
+                    # Proactive RPM/TPM Rate limit smoothing pacing anchor
+                    time.sleep(2)
+
+        except Exception as e:
+            logging.critical(f"Global operational pipeline failure encountered: {e}")
+            return
+
+        print("\n" + "=" * 95)
         print(f" 📈 METRIC TERMINAL REPORT SUMMARY OUTCOME")
-        print("="*95)
+        print("=" * 95)
         print(f"  ✔️ Total Active Target Countries Tracked  : {len(self.country_profiles)}")
         print(f"  ✔️ Total Valid Match Opportunities Found  : {len(opportunities)}")
         print(f"  ✔️ Total Output Word Files Compiled      : {len(opportunities) * 5}")
-        print("="*95 + "\n")
+        print("=" * 95 + "\n")
+
 
 if __name__ == "__main__":
     agent = StudioAturiProcurementHunter()
