@@ -3,26 +3,18 @@ import json
 import logging
 import re
 import hashlib
-import zipfile
+import html
 import smtplib
 import time
-import io
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Set, Any
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 from urllib.parse import urljoin, urlparse
 import requests
 from dotenv import load_dotenv
-
-# Native Google GenAI SDK (google-genai==2.6.0)
-from google import genai
-from google.genai import types
-from google.genai import errors
 
 load_dotenv()
 
@@ -117,18 +109,8 @@ class TenderOpportunity:
 
 class StudioAturiProcurementHunter:
     def __init__(self):
-        gemini_key = os.getenv("GEMINI_API_KEY")
-        if not gemini_key:
-            logging.error("CRITICAL: GEMINI_API_KEY environment variable is missing!")
-
-        self.ai_client = genai.Client(api_key=gemini_key) if gemini_key else None
-        # self.target_email = "nduhiu254@gmail.com"
         self.target_email = "nguginsons@gmail.com"
         self.history_file = "processed_jobs.json"
-
-        self.fob_template = "Studio_Aturi_Form_of_Bid.docx"
-        self.financial_template = "Studio_Aturi_Financial_Proposal.docx"
-        self.nda_template = "Studio_Aturi_Mutual_NDA.docx"
 
         self.http_timeout = 20
         self.http_headers = {
@@ -358,225 +340,103 @@ class StudioAturiProcurementHunter:
         return found_tenders
 
     def generate_tender_intelligence(self, tender: TenderOpportunity) -> Dict[str, Any]:
-        fallback_data = {
-            "clean_currency": "USD", "phase1_cost": "1,500,000", "phase2_cost": "1,200,000",
-            "phase3_cost": "2,000,000", "phase4_cost": "1,000,000", "total_cost": "5,700,000",
-            "total_cost_words": "FIVE MILLION SEVEN HUNDRED THOUSAND",
+        country_currency = {
+            "Kenya": "KES",
+            "Uganda": "UGX",
+            "Tanzania": "TZS",
+            "Rwanda": "RWF",
+            "Congo": "CDF",
+            "Dubai": "AED",
+            "Ethiopia": "ETB",
+        }
+        currency = country_currency.get(tender.country, "USD")
+
+        return {
+            "clean_currency": currency,
             "rfp_reference_no": f"RFP-REF-{tender.id.upper()}",
-            "client_address": "Main Commercial Enterprise Plaza",
-            "application_steps_markdown": "1. Format submission envelope details.\n2. Dispatch proposal package elements.",
-            "inferred_requirements_markdown": "• Strategic Advisory Discovery\n• Scaled Execution Rollout Plan",
-            "inferred_details_markdown": "A comprehensive creative consulting delivery frame focused on long-term value realization profiles."
+            "client_address": f"{tender.company} procurement office",
+            "summary_markdown": (
+                f"- Country: {tender.country}\n"
+                f"- Company: {tender.company}\n"
+                f"- Source portal: {tender.source_portal}\n"
+                f"- Posted at: {tender.posted_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                f"- Application URL: {tender.apply_url}"
+            ),
+            "response_angle_markdown": (
+                f"1. Confirm fit against the stated scope.\n"
+                f"2. Open with a concise capability note tailored to {tender.country}.\n"
+                f"3. Attach or link the most relevant Studio Aturi work samples.\n"
+                f"4. Ask for clarification on timeline, budget, and submission format."
+            ),
+            "key_actions_markdown": (
+                f"- Review the opportunity text for submission requirements.\n"
+                f"- Validate deadlines, contact details, and eligibility criteria.\n"
+                f"- Prepare a short, direct response focused on outcomes and delivery."
+            ),
+            "notes_markdown": (
+                "This email is generated without AI. It uses the portal metadata and a fixed response structure."
+            ),
         }
 
-        if not self.ai_client:
-            return fallback_data
-
-        prompt = f"""
-        Analyze the following corporate RFP opportunity:
-        Title: {tender.title}
-        Company: {tender.company}
-        Country: {tender.country}
-        Description: {tender.description}
-
-        Generate a structured JSON configuration layout containing metadata mappings to customize corporate template blocks.
-        The extracted currency should follow localized context (e.g., KES for Kenya, AED for Dubai, USD for global NGOs).
-
-        Return ONLY a JSON object matching this schema exactly:
-        {{
-           "clean_currency": "USD",
-           "phase1_cost": "1,200,000",
-           "phase2_cost": "950,000",
-           "phase3_cost": "1,500,000",
-           "phase4_cost": "800,000",
-           "total_cost": "4,450,000",
-           "total_cost_words": "FOUR MILLION FOUR HUNDRED AND FIFTY THOUSAND",
-           "rfp_reference_no": "RFP-REF-7721",
-           "client_address": "Corporate Business Office HQ",
-           "application_steps_markdown": "Step 1: Core discovery evaluation\\nStep 2: Executive review submission",
-           "inferred_requirements_markdown": "- Technical asset blueprint manual\\n- Production packaging designs",
-           "inferred_details_markdown": "Deep descriptive summary analysis of the organizational scope transformation parameters"
-        }}
-        """
-
-        max_retries = 3
-        backoff_delay = 26
-
-        for attempt in range(max_retries):
-            try:
-                response = self.ai_client.models.generate_content(
-                    model='gemini-2.5-flash', contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.15)
-                )
-                return json.loads(response.text)
-            except errors.APIError as e:
-                if e.code == 429:
-                    logging.warning(
-                        f"Quota rate limit hit (429). Attempt {attempt + 1}/{max_retries}. Backing off for {backoff_delay}s...")
-                    time.sleep(backoff_delay)
-                else:
-                    logging.error(f"APIError occurred processing {tender.id}: {e}")
-                    break
-            except Exception as e:
-                logging.error(f"Unexpected parsing exception for {tender.id}: {e}")
-                break
-
-        logging.error(f"Failed to acquire Gemini metrics for {tender.id}. Using production fallback structures.")
-        return fallback_data
-
-    def process_docx_to_memory(self, template_path: str, intel: Dict[str, Any],
-                               tender: TenderOpportunity) -> io.BytesIO | None:
-        """Processes docx templates completely in memory, avoiding heavy local storage reads/writes."""
-        if not os.path.exists(template_path):
-            logging.error(f"Template path missing from system context: {template_path}")
-            return None
-        try:
-            replacements = {
-                "[Insert Date]": datetime.now().strftime("%B %d, %Y"),
-                "[Insert RFP Ref No.]": intel.get("rfp_reference_no", "RFP-REF-GEN"),
-                "[Insert Project Name (e.g., Corporate Rebranding & Strategy Advisory)]": tender.title,
-                "[Insert Client Company Name & Procurement Committee Address]": f"{tender.company} - {intel.get('client_address', 'Main Corporate Office')}",
-                "[INSERT CLIENT COMPANY NAME]": tender.company,
-                "[Insert Country/Jurisdiction]": tender.country,
-                "[Insert Address]": intel.get('client_address', 'Corporate Headquarters'),
-                "[Insert Preferred Jurisdiction, e.g., the Republic of Kenya / Dubai (DIFC)]": f"the Republic of {tender.country}" if tender.country != "Dubai" else "Dubai (DIFC)",
-                "[Insert Currency, e.g., KES / USD / AED]": intel.get("clean_currency", "USD"),
-                "[Insert Currency and Total Numeric Amount]": f"{intel.get('clean_currency')} {intel.get('total_cost')}",
-                "[Insert Amount in Words]": intel.get("total_cost_words", "SPECIFIED AMOUNT"),
-                "[Insert Total]": intel.get("total_cost"),
-                "[Insert Amount]": intel.get("phase1_cost", "As Agreed")
-            }
-
-            memory_buffer = io.BytesIO()
-            with zipfile.ZipFile(template_path, 'r') as zin:
-                with zipfile.ZipFile(memory_buffer, 'w', zipfile.ZIP_DEFLATED) as zout:
-                    for item in zin.infolist():
-                        data = zin.read(item.filename)
-                        if any(x in item.filename for x in ["document.xml", "header", "footer"]):
-                            xml_content = data.decode('utf-8', errors='ignore')
-                            for placeholder, replacement in replacements.items():
-                                xml_content = xml_content.replace(placeholder, str(replacement))
-                            data = xml_content.encode('utf-8')
-                        zout.writestr(item, data)
-
-            memory_buffer.seek(0)
-            return memory_buffer
-        except Exception as e:
-            logging.error(f"Failed to generate in-memory structural template {template_path}: {e}")
-            return None
-
-    def create_informational_docx_in_memory(self, template_path: str, title: str,
-                                            content_markdown: str) -> io.BytesIO | None:
-        if not os.path.exists(template_path):
-            return None
-        try:
-            clean_content = content_markdown.replace("\n", " ").replace('"', '\\"').replace("<", "&lt;").replace(">",
-                                                                                                                 "&gt;")
-            memory_buffer = io.BytesIO()
-            with zipfile.ZipFile(template_path, 'r') as zin:
-                with zipfile.ZipFile(memory_buffer, 'w', zipfile.ZIP_DEFLATED) as zout:
-                    for item in zin.infolist():
-                        data = zin.read(item.filename)
-                        if "document.xml" in item.filename:
-                            document_wireframe = (
-                                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-                                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-                                '<w:body>'
-                                '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="32"/></w:rPr><w:t>{doc_title}</w:t></w:r></w:p>'
-                                '<w:p><w:r><w:t>{doc_content}</w:t></w:r></w:p>'
-                                '</w:body></w:document>'
-                            ).format(doc_title=title, doc_content=clean_content)
-                            data = document_wireframe.encode('utf-8')
-                        zout.writestr(item, data)
-            memory_buffer.seek(0)
-            return memory_buffer
-        except Exception as e:
-            logging.error(f"In-memory markdown document tracking failure: {e}")
-            return None
-
     def send_production_email(self, smtp_session: smtplib.SMTP, sender_email: str, tender: TenderOpportunity,
-                              intel: Dict[str, Any], memory_attachments: Dict[str, io.BytesIO]):
-        """Dispatches email payloads securely over an active, persistent SMTP stream session."""
+                              intel: Dict[str, Any]):
+        """Dispatches a detailed opportunity email over an active SMTP session."""
         bcc_env = os.getenv("BCC_EMAILS", "")
         bcc_list = [email.strip() for email in bcc_env.split(",") if email.strip()]
 
         email_extract = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', tender.description)
         direct_apply_email = email_extract[0] if email_extract else "Use submission links below"
+        safe_description = html.escape(tender.description or "")
 
         msg = MIMEMultipart()
         msg['From'] = sender_email
         msg['To'] = self.target_email
-        msg['Subject'] = f"🎯 [Match Found] Lead Alert - {tender.country} ({tender.company})"
+        msg['Subject'] = f"[SASAFRIK TENDER BOT FOUND NEW TENDER OPPORTUNITY] Lead Alert - {tender.country} ({tender.company})"
 
         html_content = f"""
         <html>
-        <body style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #2D3748; line-height: 1.6; margin: 0; padding: 20px; background-color: #F7FAFC;">
-            <div style="max-width: 650px; margin: 0 auto; background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
-                <div style="background: #1A365D; padding: 25px; color: #FFFFFF; text-align: center;">
-                    <h1 style="margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.5px;">Studio Aturi Intelligence Pipeline</h1>
-                    <p style="margin: 5px 0 0 0; color: #90CDF4; font-size: 14px; text-transform: uppercase; font-weight: bold;">Private Sector Match Confirmed</p>
+        <body style="font-family: Arial, sans-serif; color: #1F2937; line-height: 1.5; margin: 0; padding: 24px; background-color: #F9FAFB;">
+            <div style="max-width: 760px; margin: 0 auto; background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px; overflow: hidden;">
+                <div style="background: #111827; padding: 20px 24px; color: #FFFFFF;">
+                    <div style="font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; color: #93C5FD;">Studio Aturi Opportunity Alert</div>
+                    <h1 style="margin: 8px 0 0 0; font-size: 22px; font-weight: 700;">{tender.title}</h1>
                 </div>
-                <div style="padding: 30px;">
-                    <table style="width: 100%; border-collapse: collapse; margin-bottom: 25px;">
-                        <tr>
-                            <td style="padding: 8px 0; font-weight: bold; width: 30%; color: #4A5568;">Territory Source</td>
-                            <td style="padding: 8px 0; color: #1A202C;"><span style="background: #EBF8FF; color: #2B6CB0; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 13px;">{tender.country.upper()}</span></td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 8px 0; font-weight: bold; color: #4A5568;">Enterprise Client</td>
-                            <td style="padding: 8px 0; color: #1A202C; font-weight: 500;">{tender.company}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 8px 0; font-weight: bold; color: #4A5568;">Opportunity Title</td>
-                            <td style="padding: 8px 0; color: #2D3748; font-weight: 500;">{tender.title}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 8px 0; font-weight: bold; color: #4A5568;">Sourcing Channel</td>
-                            <td style="padding: 8px 0; color: #718096; font-size: 14px;">{tender.source_portal}</td>
-                        </tr>
+                <div style="padding: 24px;">
+                    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                        <tr><td style="padding: 6px 0; width: 220px; color: #6B7280; font-weight: 600;">Company</td><td style="padding: 6px 0;">{tender.company}</td></tr>
+                        <tr><td style="padding: 6px 0; color: #6B7280; font-weight: 600;">Country</td><td style="padding: 6px 0;">{tender.country}</td></tr>
+                        <tr><td style="padding: 6px 0; color: #6B7280; font-weight: 600;">Portal</td><td style="padding: 6px 0;">{tender.source_portal}</td></tr>
+                        <tr><td style="padding: 6px 0; color: #6B7280; font-weight: 600;">Reference</td><td style="padding: 6px 0;">{intel.get("rfp_reference_no")}</td></tr>
+                        <tr><td style="padding: 6px 0; color: #6B7280; font-weight: 600;">Currency hint</td><td style="padding: 6px 0;">{intel.get("clean_currency")}</td></tr>
                     </table>
 
-                    <h3 style="color: #2C5282; border-bottom: 2px solid #E2E8F0; padding-bottom: 8px; margin-top: 0;">📋 Raw Opportunity Context</h3>
-                    <p style="background: #F8FAFC; padding: 15px; border-radius: 6px; border-left: 4px solid #CBD5E0; font-size: 14px; color: #4A5568; margin-bottom: 25px;">{tender.description}</p>
+                    <h3 style="margin: 24px 0 10px 0; font-size: 16px;">Opportunity Summary</h3>
+                    <pre style="white-space: pre-wrap; margin: 0; padding: 14px; background: #F3F4F6; border: 1px solid #E5E7EB; border-radius: 6px; font-family: Arial, sans-serif; font-size: 14px;">{intel.get("summary_markdown")}</pre>
 
-                    <h3 style="color: #2C5282; border-bottom: 2px solid #E2E8F0; padding-bottom: 8px;">🚀 Technical Application Roadmap</h3>
-                    <div style="background: #EDF2F7; padding: 15px; border-radius: 6px; font-family: 'Courier New', Courier, monospace; font-size: 13px; color: #2D3748; white-space: pre-wrap; margin-bottom: 25px;">{intel.get("application_steps_markdown")}</div>
+                    <h3 style="margin: 24px 0 10px 0; font-size: 16px;">Source Description</h3>
+                    <pre style="white-space: pre-wrap; margin: 0; padding: 14px; background: #F9FAFB; border: 1px solid #E5E7EB; border-radius: 6px; font-family: Arial, sans-serif; font-size: 14px;">{safe_description}</pre>
 
-                    <table style="width: 100%; margin-top: 20px; background: #F7FAFC; padding: 15px; border-radius: 6px;">
-                        <tr>
-                            <td style="font-size: 14px; color: #4A5568;"><strong>Direct Target Email:</strong> {direct_apply_email}</td>
-                        </tr>
-                        <tr>
-                            <td style="font-size: 14px; color: #4A5568; padding-top: 5px;"><strong>Portal Hyperlink:</strong> <a href="{tender.apply_url}" style="color: #3182CE; text-decoration: none; font-weight: 500;">{tender.apply_url}</a></td>
-                        </tr>
+                    <h3 style="margin: 24px 0 10px 0; font-size: 16px;">Recommended Response</h3>
+                    <pre style="white-space: pre-wrap; margin: 0; padding: 14px; background: #F3F4F6; border: 1px solid #E5E7EB; border-radius: 6px; font-family: Arial, sans-serif; font-size: 14px;">{intel.get("response_angle_markdown")}</pre>
+
+                    <h3 style="margin: 24px 0 10px 0; font-size: 16px;">Next Actions</h3>
+                    <pre style="white-space: pre-wrap; margin: 0; padding: 14px; background: #F3F4F6; border: 1px solid #E5E7EB; border-radius: 6px; font-family: Arial, sans-serif; font-size: 14px;">{intel.get("key_actions_markdown")}</pre>
+
+                    <table style="width: 100%; margin-top: 22px; border-top: 1px solid #E5E7EB; padding-top: 16px;">
+                        <tr><td style="padding: 4px 0; color: #6B7280; font-weight: 600;">Direct email detected</td><td style="padding: 4px 0;">{direct_apply_email}</td></tr>
+                        <tr><td style="padding: 4px 0; color: #6B7280; font-weight: 600;">Portal link</td><td style="padding: 4px 0;"><a href="{tender.apply_url}" style="color: #2563EB; text-decoration: none;">{tender.apply_url}</a></td></tr>
                     </table>
                 </div>
-                <div style="background: #EDF2F7; padding: 15px 30px; text-align: center; border-top: 1px solid #E2E8F0;">
-                    <p style="margin: 0; font-size: 11px; color: #718096; font-style: italic;">Automated generation pipeline pass complete. 5 bespoke proposal documents attached below.</p>
-                </div>
+                <div style="padding: 14px 24px; background: #F9FAFB; border-top: 1px solid #E5E7EB; color: #6B7280; font-size: 12px;">{intel.get("notes_markdown")}</div>
             </div>
         </body>
         </html>
         """
         msg.attach(MIMEText(html_content, 'html'))
 
-        for file_name, memory_stream in memory_attachments.items():
-            if memory_stream is not None:
-                try:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(memory_stream.read())
-                    encoders.encode_base64(part)
-                    part.add_header("Content-Disposition", f"attachment; filename={file_name}")
-                    msg.attach(part)
-                    # Reset buffer read head position for structural re-entry checks if needed
-                    memory_stream.seek(0)
-                except Exception as e:
-                    logging.error(f"Error packing file stream memory buffer allocation {file_name}: {e}")
-
         recipient_envelope = [self.target_email] + bcc_list
         smtp_session.sendmail(sender_email, recipient_envelope, msg.as_string())
-        logging.info(
-            f"[+] Direct Payload Dispatched via Open SMTP Stream for ID: {tender.id} (Bcc elements: {len(bcc_list)})")
+        logging.info(f"[+] Detailed email dispatched for ID: {tender.id} (Bcc elements: {len(bcc_list)})")
 
     def run(self):
         opportunities = self.scrape_all_opportunities()
@@ -611,45 +471,15 @@ class StudioAturiProcurementHunter:
                     logging.info(f"Processing sequence node [{idx}/{len(opportunities)}] -> ID: {tender.id}")
                     intel = self.generate_tender_intelligence(tender)
 
-                    # Allocate unique output names
-                    fob_name = f"Studio_Aturi_Form_of_Bid_{tender.id}.docx"
-                    fin_name = f"Studio_Aturi_Financial_Proposal_{tender.id}.docx"
-                    nda_name = f"Studio_Aturi_Mutual_NDA_{tender.id}.docx"
-                    details_name = f"Opportunity_Details_{tender.id}.docx"
-                    reqs_name = f"Opportunity_Requirements_{tender.id}.docx"
-
-                    # Generate virtual in-memory file buffers
-                    memory_attachments = {
-                        fob_name: self.process_docx_to_memory(self.fob_template, intel, tender),
-                        fin_name: self.process_docx_to_memory(self.financial_template, intel, tender),
-                        nda_name: self.process_docx_to_memory(self.nda_template, intel, tender),
-                        details_name: self.create_informational_docx_in_memory(self.nda_template,
-                                                                               f"Details - {tender.title}",
-                                                                               intel.get("inferred_details_markdown",
-                                                                                         "")),
-                        reqs_name: self.create_informational_docx_in_memory(self.nda_template,
-                                                                            f"Requirements - {tender.title}",
-                                                                            intel.get("inferred_requirements_markdown",
-                                                                                      ""))
-                    }
-
                     print(f"\n⚡ [{idx}/{len(opportunities)}] TARGET TERRITORY IDENTIFIED: {tender.country.upper()}")
                     print(f"  ▪️ Opportunity ID : {tender.id}")
                     print(f"  ▪️ Business Entity : {tender.company}")
                     print(f"  ▪️ Pipeline Focus  : {tender.title}")
                     print(f"  ▪️ Intake Portal   : {tender.source_portal}")
-                    print(f"  📦 Generated Valid Virtual Artifact Package Components inside RAM Workspace Allocation.")
+                    print(f"  📧 Prepared detailed email content without AI or document generation.")
 
-                    # Push via current open execution pipeline context block
-                    self.send_production_email(server, smtp_user, tender, intel, memory_attachments)
-
-                    # Force closing memory buffers instantly to reclaim platform heap space dynamically
-                    for buf in memory_attachments.values():
-                        if buf:
-                            buf.close()
-
-                    print(
-                        f"  ↳ STATUS: Node pipeline execution completed. Safe virtual memory buffers unlinked cleanly.")
+                    self.send_production_email(server, smtp_user, tender, intel)
+                    print(f"  ↳ STATUS: Email dispatch completed.")
                     print("-" * 95)
 
                     self.processed_tender_ids.add(tender.id)
@@ -667,7 +497,7 @@ class StudioAturiProcurementHunter:
         print("=" * 95)
         print(f"  ✔️ Total Active Target Countries Tracked  : {len(self.country_profiles)}")
         print(f"  ✔️ Total Valid Match Opportunities Found  : {len(opportunities)}")
-        print(f"  ✔️ Total Output Word Files Compiled      : {len(opportunities) * 5}")
+        print(f"  ✔️ Total Detailed Emails Sent            : {len(opportunities)}")
         print("=" * 95 + "\n")
 
 
