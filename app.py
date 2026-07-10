@@ -142,7 +142,7 @@ class StudioAturiProcurementHunter:
                              "Consumer Insights", "Market Discovery", "Corporate Identity Guidelines", "Brand Manual",
                              "Value Proposition Development", "Stakeholder Perception Survey"],
                 "urls": ["https://tenderflow.co.ke", "https://developmentaid.org",
-                         "https://safaricom.co.ke/about/suppliers", "https://eastafricatenders.com"]
+                         "https://www.safaricom.co.ke/suppliers/tenders", "https://eastafricatenders.com"]
             },
             "Uganda": {
                 "keywords": ["Brand Audit & Diagnostic", "Corporate Profile", "Visual Identity Review",
